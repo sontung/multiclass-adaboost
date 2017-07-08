@@ -1,0 +1,209 @@
+import numpy as np
+import scipy.io
+import h5py
+import sys
+from keras.wrappers.scikit_learn import KerasClassifier
+from keras.models import Sequential
+from keras.layers import Dense, Dropout, Activation, Flatten
+from keras.layers import Convolution2D, MaxPooling2D
+from keras.optimizers import SGD
+from keras.utils import np_utils
+from keras.preprocessing.image import ImageDataGenerator
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+
+BIG_DIR = '/home/sontung/Machine_Learning/haar_features'
+
+
+def create_model(inp_shape=(1, 32, 32), nb_classes=10):
+    model = Sequential()
+
+    model.add(Convolution2D(32, 3, 3, border_mode='same',
+                            input_shape=inp_shape))
+    model.add(Activation('relu'))
+    model.add(Convolution2D(32, 3, 3))
+    model.add(Activation('relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
+
+    model.add(Convolution2D(64, 3, 3, border_mode='same'))
+    model.add(Activation('relu'))
+    model.add(Convolution2D(64, 3, 3))
+    model.add(Activation('relu'))
+    model.add(MaxPooling2D(pool_size=(1, 1)))
+    model.add(Dropout(0.25))
+
+    model.add(Flatten())
+    model.add(Dense(512))
+    model.add(Activation('relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(nb_classes))
+    model.add(Activation('softmax'))
+    sgd = SGD(lr=0.005, decay=1e-6, momentum=0.9, nesterov=True)
+    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
+    return model
+
+
+def make_estimator():
+    return KerasClassifier(build_fn=create_model, nb_epoch=100, batch_size=32, verbose=0)
+
+
+def make_list_estimators(n_estimators):
+    res = []
+    for i in range(n_estimators):
+        res.append(make_estimator())
+    return res
+
+
+def read_data():
+    dir_to_data = '%s/data/cifar10_32x32.mat' % BIG_DIR
+    image_type = 'train_data'
+    nb_channel = 1
+    image_size = 32
+
+    f = h5py.File(dir_to_data)
+    ori_img = np.transpose(np.array(f[image_type]))
+    ori_img = ori_img.reshape((50000, nb_channel, image_size, image_size), order='F')
+    labels = scipy.io.loadmat('%s/data/labels.mat' % BIG_DIR)['labels']
+    f.close()
+    ori_img.astype("float32")
+    ori_img /= 255.0
+    labels = np_utils.to_categorical(labels, 10)
+    labels.astype("float32")
+    return ori_img, labels
+
+
+def read_testdata():
+    dir_to_data = '%s/data/cifar10_32x32_test.mat' % BIG_DIR
+    image_type = 'train_data'
+    nb_channel = 1
+    image_size = 32
+
+    f = h5py.File(dir_to_data)
+    ori_img = np.transpose(np.array(f[image_type]))
+    ori_img = ori_img.reshape((300000, nb_channel, image_size, image_size), order='F')
+    f.close()
+    ori_img.astype("float32")
+    ori_img /= 255.0
+    return ori_img
+
+
+def pseudo_loss(weights, y_pred, y_true):
+    loss = np.transpose(y_pred) - np.sum(np.multiply(y_pred, y_true), axis=1)
+    e = 0.5*np.sum(weights*np.transpose(1+loss))
+    beta = e/(1-e)
+    print e, beta
+    w = weights*np.transpose(beta**(0.5*(1-loss)))
+    w = w / np.sum(w)
+    return beta, w, e
+
+
+def probabilities(weights):
+    p = np.sum(weights, axis=1)
+    return p / np.sum(p, axis=0)
+
+
+def train(X, y, X_val, y_val, M):
+    """
+    :param X: training samples
+    :param y: training labels
+    :param X_val: validating samples
+    :param y_val: validating labels
+    :param M: number of estimators
+    :return: list of trained estimators and model weights
+    """
+    K = 10  # number of classes
+    estimators = []  # list of M estimators
+    n = X.shape[0]  # number of training samples
+    n2 = X_val.shape[0]  # number of validating samples
+    w = (np.ones((n, 10))-y)*(1.0/(n*(K-1)))  # weights
+    betas = []  # list of weights for estimators
+
+    for m in range(M):
+        indices = np.random.choice(range(n), n, replace=True, p=probabilities(w))
+        if m == 0:
+            X_resampled = X
+            y_resampled = y
+        else:
+            X_resampled = X[indices, :]
+            y_resampled = y[indices, :]
+
+        # Fitting
+        print "\nFitting %d-th estimator" % (m+1)
+        estimator = create_model()
+        datagen = ImageDataGenerator(
+            featurewise_center=False,  # set input mean to 0 over the dataset
+            featurewise_std_normalization=False,  # divide inputs by std of the dataset
+            zca_whitening=False,  # apply ZCA whitening
+            rotation_range=10,  # randomly rotate images in the range (degrees, 0 to 180)
+            width_shift_range=0.1,  # randomly shift images horizontally (fraction of total width)
+            height_shift_range=0.1,  # randomly shift images vertically (fraction of total height)
+            horizontal_flip=True,  # randomly flip images
+            vertical_flip=False)  # randomly flip images
+
+        # compute quantities required for featurewise normalization
+        # (std, mean, and principal components if ZCA whitening is applied)
+        # fit the model on the batches generated by datagen.flow()
+        datagen.fit(X_resampled)
+
+        estimator.fit_generator(datagen.flow(X_resampled, y_resampled, batch_size=32),
+                                samples_per_epoch=X_resampled.shape[0], nb_epoch=100, verbose=0)
+
+        # Validating error
+        y_pred = estimator.predict(X_val)
+        incorrect = np.argmax(y_pred, axis=1) != np.argmax(y_val, axis=1)
+        error_rate = float(sum(incorrect)/float(n2))
+        print "Accuracy is %f" % (1-error_rate)
+
+        # Computing loss
+        y_pred_proba = estimator.predict_proba(X_resampled)
+        betaT, w, e = pseudo_loss(w, y_pred_proba, y_resampled)
+
+        # Adding things
+        betas.append(betaT)
+        estimators.append(estimator)
+
+    betas = np.log(1.0/np.array(betas))
+    return estimators, betas
+
+
+def predict(list_of_estimators, weights, x):
+    proba = np.sum(np.array([weights[i]*list_of_estimators[i].predict_proba(x) for i in range(len(list_of_estimators))]), axis=0)
+    return np.argmax(proba, axis=1)
+
+
+def print_predictions(pred):
+    print 'id,label'
+    categories = {0: "airplane",
+                  1: "automobile",
+                  2: "bird",
+                  3: "cat",
+                  4: "deer",
+                  5: "dog",
+                  6: "frog",
+                  7: "horse",
+                  8: "ship",
+                  9: "truck"}
+    for p in range(len(pred)):
+        print '%d,%s' % (p + 1, categories[pred[p]])
+
+
+if __name__ == "__main__":
+    x_all, y_all = read_data()
+    x_train, x_val, y_train, y_val = train_test_split(x_all, y_all, test_size=0.2, random_state=0)
+    es, ws = train(x_train, y_train, x_val, y_val, 10)
+    y_predict = predict(es, ws, x_val)
+    y_val = np.argmax(y_val, axis=1)
+    acc = accuracy_score(y_val, y_predict)
+    print "Final accuracy is %f" % acc
+
+    print "Generating predictions"
+    x_test = read_testdata()
+    y_test = predict(es, ws, x_test)
+
+    print 'Writing to csv'
+    sys.stdout = open('/home/sontung/Machine_Learning/haar_features/predictions/boost.csv', 'w')
+    print_predictions(y_test)
+    sys.stdout = sys.__stdout__
+   
